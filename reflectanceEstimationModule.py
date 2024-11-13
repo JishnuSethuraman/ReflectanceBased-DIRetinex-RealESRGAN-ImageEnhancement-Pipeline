@@ -1,3 +1,5 @@
+# File: image_enhancement_pipeline.py
+
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,7 +20,7 @@ torch.manual_seed(42)
 np.random.seed(42)
 
 # Parameters
-num_epochs = 10  # Adjust the number of epochs as needed
+num_epochs = 5  # Adjust the number of epochs as needed
 batch_size = 8
 learning_rate = 1e-4
 gamma = 2.2  # Gamma value for gamma correction
@@ -86,7 +88,7 @@ transform = transforms.Compose([
 dataset = LOLDataset(low_light_image_dir, high_light_image_dir, transform)
 dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-# Define the lightweight CNN
+# Define the lightweight CNN for Reflectance Estimation
 class CoefficientPredictor(nn.Module):
     def __init__(self):
         super(CoefficientPredictor, self).__init__()
@@ -101,8 +103,8 @@ class CoefficientPredictor(nn.Module):
         coefficients = torch.tanh(self.conv3(out))  # Output in [-1, 1]
         return coefficients
 
-# Instantiate the model
-model = CoefficientPredictor().to(device)
+# Instantiate the reflectance estimation model
+reflectance_model = CoefficientPredictor().to(device)
 
 # Define the mapping function for 'a' and 'b'
 def map_coefficients(coefficients):
@@ -154,68 +156,215 @@ def total_loss(I_l, I_h_enhanced, a, b):
     vs_loss = variance_suppression_loss(a, b)
     return rd_loss + vs_loss
 
-# Define the optimizer
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+# Define the optimizer for reflectance estimation model
+optimizer = torch.optim.Adam(reflectance_model.parameters(), lr=learning_rate)
 
-# Training loop
-for epoch in range(num_epochs):
-    model.train()
-    epoch_loss = 0
-    for I_l, I_h in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
-        I_l = I_l.to(device)
-        I_h = I_h.to(device)
+# Check if the trained model exists
+model_path = 'coefficient_predictor.pth'
+if os.path.exists(model_path):
+    # Load the trained model
+    reflectance_model.load_state_dict(torch.load(model_path, map_location=device))
+    print("Reflectance Estimation Model loaded successfully.")
+else:
+    # Train the model
+    print("Training Reflectance Estimation Model...")
+    for epoch in range(num_epochs):
+        reflectance_model.train()
+        epoch_loss = 0
+        for I_l, I_h in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            I_l = I_l.to(device)
+            I_h = I_h.to(device)
 
-        # Predict coefficients
-        coefficients = model(I_l)
-        a, b = map_coefficients(coefficients)
+            # Predict coefficients
+            coefficients = reflectance_model(I_l)
+            a, b = map_coefficients(coefficients)
 
-        # Adjust brightness and contrast
-        I_h_enhanced = brightness_contrast_adjustment(I_l, a, b)
+            # Adjust brightness and contrast
+            I_h_enhanced = brightness_contrast_adjustment(I_l, a, b)
 
-        # Compute loss
-        loss = total_loss(I_l, I_h_enhanced, a, b)
+            # Compute loss
+            loss = total_loss(I_l, I_h_enhanced, a, b)
 
-        # Check for NaNs
-        if torch.isnan(loss):
-            print("Loss is NaN, stopping training.")
-            break
+            # Check for NaNs
+            if torch.isnan(loss):
+                print("Loss is NaN, stopping training.")
+                break
 
-        # Backpropagation
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            # Backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-        epoch_loss += loss.item()
+            epoch_loss += loss.item()
 
-    avg_loss = epoch_loss / len(dataloader)
-    print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}")
+        avg_loss = epoch_loss / len(dataloader)
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}")
 
-    # Save sample enhanced images
-    model.eval()
+    # Save the trained model
+    torch.save(reflectance_model.state_dict(), model_path)
+    print("Reflectance Estimation Model trained and saved.")
+
+# =========================
+# SRCNN Model
+# =========================
+
+class SRCNN(nn.Module):
+    def __init__(self):
+        super(SRCNN, self).__init__()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=9, padding=4)
+        self.conv2 = nn.Conv2d(64, 32, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv2d(32, 3, kernel_size=5, padding=2)
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        x = self.relu(self.conv1(x))
+        x = self.relu(self.conv2(x))
+        x = self.conv3(x)
+        return x
+
+# Load the SRCNN model
+srcnn_model = SRCNN().to(device)
+
+# Load pretrained weights if available
+try:
+    srcnn_model.load_state_dict(torch.load('srcnn.pth', map_location=device))
+    print("Pretrained SRCNN weights loaded successfully.")
+except FileNotFoundError:
+    print("No pretrained SRCNN weights found. Please download 'srcnn.pth' and place it in the current directory.")
+    print("You can download pretrained SRCNN weights from: https://github.com/yjn870/SRCNN-pytorch")
+
+# Set the SRCNN model to evaluation mode
+srcnn_model.eval()
+
+# =========================
+# DnCNN Model for Noise Reduction
+# =========================
+
+class DnCNN(nn.Module):
+    def __init__(self, channels=3, num_of_layers=17):
+        super(DnCNN, self).__init__()
+        kernel_size = 3
+        padding = 1
+        features = 64
+        layers = []
+        layers.append(nn.Conv2d(in_channels=channels, out_channels=features, kernel_size=kernel_size, padding=padding, bias=False))
+        layers.append(nn.ReLU(inplace=True))
+        for _ in range(num_of_layers-2):
+            layers.append(nn.Conv2d(in_channels=features, out_channels=features, kernel_size=kernel_size, padding=padding, bias=False))
+            layers.append(nn.BatchNorm2d(features))
+            layers.append(nn.ReLU(inplace=True))
+        layers.append(nn.Conv2d(in_channels=features, out_channels=channels, kernel_size=kernel_size, padding=padding, bias=False))
+        self.dncnn = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        out = self.dncnn(x)
+        return x - out  # Residual learning
+
+# Load the DnCNN model
+dncnn_model = DnCNN().to(device)
+
+# Load pretrained weights for DnCNN
+try:
+    dncnn_model.load_state_dict(torch.load('dncnn.pth', map_location=device))
+    print("Pretrained DnCNN weights loaded successfully.")
+except FileNotFoundError:
+    print("No pretrained DnCNN weights found. Please download 'dncnn.pth' and place it in the current directory.")
+    print("You can download pretrained DnCNN weights from: https://github.com/SaoYan/DnCNN-PyTorch")
+
+# Set the DnCNN model to evaluation mode
+dncnn_model.eval()
+
+# =========================
+# Image Processing Functions
+# =========================
+
+# Function to enhance low-light image
+def enhance_low_light_image(img_tensor):
     with torch.no_grad():
-        sample_I_l = I_l[:4]  # Get a batch of low-light images
-        sample_I_h = I_h[:4]  # Corresponding high-light images
-        coefficients = model(sample_I_l)
+        coefficients = reflectance_model(img_tensor)
         a, b = map_coefficients(coefficients)
-        I_h_enhanced = brightness_contrast_adjustment(sample_I_l, a, b)
+        enhanced_tensor = brightness_contrast_adjustment(img_tensor, a, b)
+    return enhanced_tensor
 
-        # Visualize and save the images
-        for idx in range(sample_I_l.size(0)):
-            fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-            axs[0].imshow(sample_I_l[idx].cpu().permute(1, 2, 0).numpy())
-            axs[0].set_title('Low-Light Input')
-            axs[0].axis('off')
+# Function to perform super-resolution using SRCNN
+def super_resolve_image(img_tensor, upscale_factor=2):
+    with torch.no_grad():
+        # Upsample the image using bicubic interpolation
+        upscaled_tensor = nn.functional.interpolate(img_tensor, scale_factor=upscale_factor, mode='bicubic', align_corners=False)
+        # Apply SRCNN
+        sr_tensor = srcnn_model(upscaled_tensor)
+        sr_tensor = torch.clamp(sr_tensor, 0, 1)
+    return sr_tensor
 
-            axs[1].imshow(I_h_enhanced[idx].cpu().permute(1, 2, 0).numpy())
-            axs[1].set_title('Enhanced Output')
-            axs[1].axis('off')
+# Function to apply noise reduction using DnCNN
+def reduce_noise(img_tensor):
+    with torch.no_grad():
+        denoised_tensor = dncnn_model(img_tensor)
+        denoised_tensor = torch.clamp(denoised_tensor, 0, 1)
+    return denoised_tensor
 
-            axs[2].imshow(sample_I_h[idx].cpu().permute(1, 2, 0).numpy())
-            axs[2].set_title('Ground Truth')
-            axs[2].axis('off')
+# Function to process image through all steps
+def process_image(input_image_path, output_image_path, upscale_factor=2):
+    # Load and preprocess the image
+    img = Image.open(input_image_path).convert("RGB")
+    transform = transforms.Compose([
+        transforms.ToTensor()
+    ])
+    img_tensor = transform(img).unsqueeze(0).to(device)
 
-            plt.savefig(f'output_epoch_{epoch+1}_sample_{idx+1}.png')
-            plt.close()
+    # Enhance low-light image
+    enhanced_tensor = enhance_low_light_image(img_tensor)
 
-# Save the trained model
-torch.save(model.state_dict(), 'coefficient_predictor.pth')
+    # Super-resolve the enhanced image
+    sr_tensor = super_resolve_image(enhanced_tensor, upscale_factor=upscale_factor)
+
+    # Apply noise reduction
+    final_tensor = reduce_noise(sr_tensor)
+
+    # Save the final output image
+    output_img = transforms.ToPILImage()(final_tensor.squeeze(0).cpu())
+    output_img.save(output_image_path)
+    print(f"Processed image saved at {output_image_path}")
+
+    # Display the images
+    display_images(img_tensor, enhanced_tensor, sr_tensor, final_tensor)
+
+# Function to display images at different stages
+def display_images(original_tensor, enhanced_tensor, sr_tensor, final_tensor):
+    original_img = transforms.ToPILImage()(original_tensor.squeeze(0).cpu())
+    enhanced_img = transforms.ToPILImage()(enhanced_tensor.squeeze(0).cpu())
+    sr_img = transforms.ToPILImage()(sr_tensor.squeeze(0).cpu())
+    final_img = transforms.ToPILImage()(final_tensor.squeeze(0).cpu())
+
+    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
+    axs[0].imshow(original_img)
+    axs[0].set_title('Original Low-Light Image')
+    axs[0].axis('off')
+
+    axs[1].imshow(enhanced_img)
+    axs[1].set_title('Enhanced Image')
+    axs[1].axis('off')
+
+    axs[2].imshow(sr_img)
+    axs[2].set_title('Super-Resolved Image')
+    axs[2].axis('off')
+
+    axs[3].imshow(final_img)
+    axs[3].set_title('Final Output (Denoised)')
+    axs[3].axis('off')
+
+    plt.show()
+
+# =========================
+# Example Usage
+# =========================
+
+if __name__ == "__main__":
+    # Example input image path (you can change this to your own image)
+    input_image_path = 'low_light_image.jpg'  # Path to the input low-light image
+    output_image_path = 'final_output_image.jpg'  # Path to save the final processed image
+
+    if not os.path.exists(input_image_path):
+        print(f"Input image '{input_image_path}' not found. Please provide a valid image path.")
+    else:
+        process_image(input_image_path, output_image_path, upscale_factor=2)
