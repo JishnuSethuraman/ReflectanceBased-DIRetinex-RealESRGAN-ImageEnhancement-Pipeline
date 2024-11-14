@@ -10,7 +10,7 @@ The Retinex theory models an image as a product of reflectance and illumination 
 - **Reflectance**: Represents the intrinsic properties of objects in the scene, such as color and texture.
 - **Illumination**: Represents the lighting conditions affecting the scene.
 
-This project uses the recently published DI-Retinex model, a lightweight Convolutional Neural Network (CNN) that enhances visibility by predicting brightness and contrast adjustment coefficients, achieving natural-looking results.
+This project uses the recently published [DI-Retinex model](https://arxiv.org/abs/2404.03327), a lightweight Convolutional Neural Network (CNN) that enhances visibility by predicting brightness and contrast adjustment coefficients, achieving natural-looking results.
 
 ### Real-ESRGAN
 Real-ESRGAN is a GAN-based approach for image super-resolution, enhancing image details and textures. By integrating Real-ESRGAN into the pipeline, the enhanced low-light images are upscaled, producing high-resolution outputs with improved visual quality.
