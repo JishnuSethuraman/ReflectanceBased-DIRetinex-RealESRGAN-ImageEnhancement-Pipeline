@@ -1,16 +1,20 @@
-# File: image_enhancement_pipeline.py
+# File: comparison_image_enhancement_pipeline.py
 
 import os
+import random
 import numpy as np
 import matplotlib.pyplot as plt
 from PIL import Image
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from tqdm import tqdm
+
+# Import Real-ESRGAN components
+from realesrgan.utils import RealESRGANer
+from basicsr.archs.rrdbnet_arch import RRDBNet
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -18,14 +22,13 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # Set random seed for reproducibility
 torch.manual_seed(42)
 np.random.seed(42)
+random.seed(42)
 
 # Parameters
 num_epochs = 5  # Adjust the number of epochs as needed
 batch_size = 8
 learning_rate = 1e-4
 gamma = 2.2  # Gamma value for gamma correction
-k = 255  # Maximum pixel value
-tau = 0.01  # Small constant for mapping function
 
 # Paths to the LOL dataset (adjust these paths accordingly)
 low_light_image_dir = 'LOLdataset/our485/low'
@@ -62,8 +65,11 @@ class LOLDataset(Dataset):
         return len(self.low_light_images)
 
     def __getitem__(self, idx):
-        low_img_path = os.path.join(self.low_light_dir, self.low_light_images[idx])
-        high_img_path = os.path.join(self.high_light_dir, self.high_light_images[idx])
+        low_img_name = self.low_light_images[idx]
+        high_img_name = self.high_light_images[idx]
+
+        low_img_path = os.path.join(self.low_light_dir, low_img_name)
+        high_img_path = os.path.join(self.high_light_dir, high_img_name)
 
         try:
             low_img = Image.open(low_img_path).convert('RGB')
@@ -76,7 +82,7 @@ class LOLDataset(Dataset):
             low_img = self.transform(low_img)
             high_img = self.transform(high_img)
 
-        return low_img, high_img
+        return low_img, high_img, low_img_name  # Return filename
 
 # Define transforms
 transform = transforms.Compose([
@@ -171,7 +177,7 @@ else:
     for epoch in range(num_epochs):
         reflectance_model.train()
         epoch_loss = 0
-        for I_l, I_h in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+        for I_l, I_h, _ in tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             I_l = I_l.to(device)
             I_h = I_h.to(device)
 
@@ -205,74 +211,39 @@ else:
     print("Reflectance Estimation Model trained and saved.")
 
 # =========================
-# SRCNN Model
+# Real-ESRGAN Model Integration
 # =========================
 
-class SRCNN(nn.Module):
-    def __init__(self):
-        super(SRCNN, self).__init__()
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=9, padding=4)
-        self.conv2 = nn.Conv2d(64, 32, kernel_size=5, padding=2)
-        self.conv3 = nn.Conv2d(32, 3, kernel_size=5, padding=2)
-        self.relu = nn.ReLU()
-    
-    def forward(self, x):
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.conv3(x)
-        return x
+# Initialize the Real-ESRGAN model
+def initialize_realesrgan_model(model_name='RealESRGAN_x4plus.pth'):
+    model_path = os.path.join('weights', model_name)
+    if not os.path.exists(model_path):
+        print(f"Model weights '{model_name}' not found in 'weights/' directory.")
+        print("Please download the Real-ESRGAN model weights and place them in the 'weights/' directory.")
+        exit()
 
-# Load the SRCNN model
-srcnn_model = SRCNN().to(device)
+    # Initialize the RRDBNet model
+    model = RRDBNet(
+        num_in_ch=3, num_out_ch=3, num_feat=64,
+        num_block=23, num_grow_ch=32, scale=4
+    )
 
-# Load pretrained weights if available
-try:
-    srcnn_model.load_state_dict(torch.load('srcnn.pth', map_location=device))
-    print("Pretrained SRCNN weights loaded successfully.")
-except FileNotFoundError:
-    print("No pretrained SRCNN weights found. Please download 'srcnn.pth' and place it in the current directory.")
-    print("You can download pretrained SRCNN weights from: https://github.com/yjn870/SRCNN-pytorch")
+    # Initialize the RealESRGANer
+    upsampler = RealESRGANer(
+        scale=4,
+        model_path=model_path,
+        model=model,
+        tile=0,
+        tile_pad=10,
+        pre_pad=0,
+        half=not device.type == 'cpu'  # Use FP16 only on GPU
+    )
 
-# Set the SRCNN model to evaluation mode
-srcnn_model.eval()
+    return upsampler
 
-# =========================
-# DnCNN Model for Noise Reduction
-# =========================
-
-class DnCNN(nn.Module):
-    def __init__(self, channels=3, num_of_layers=17):
-        super(DnCNN, self).__init__()
-        kernel_size = 3
-        padding = 1
-        features = 64
-        layers = []
-        layers.append(nn.Conv2d(in_channels=channels, out_channels=features, kernel_size=kernel_size, padding=padding, bias=False))
-        layers.append(nn.ReLU(inplace=True))
-        for _ in range(num_of_layers-2):
-            layers.append(nn.Conv2d(in_channels=features, out_channels=features, kernel_size=kernel_size, padding=padding, bias=False))
-            layers.append(nn.BatchNorm2d(features))
-            layers.append(nn.ReLU(inplace=True))
-        layers.append(nn.Conv2d(in_channels=features, out_channels=channels, kernel_size=kernel_size, padding=padding, bias=False))
-        self.dncnn = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        out = self.dncnn(x)
-        return x - out  # Residual learning
-
-# Load the DnCNN model
-dncnn_model = DnCNN().to(device)
-
-# Load pretrained weights for DnCNN
-try:
-    dncnn_model.load_state_dict(torch.load('dncnn.pth', map_location=device))
-    print("Pretrained DnCNN weights loaded successfully.")
-except FileNotFoundError:
-    print("No pretrained DnCNN weights found. Please download 'dncnn.pth' and place it in the current directory.")
-    print("You can download pretrained DnCNN weights from: https://github.com/SaoYan/DnCNN-PyTorch")
-
-# Set the DnCNN model to evaluation mode
-dncnn_model.eval()
+# Instantiate the Real-ESRGAN model
+realesrgan_model = initialize_realesrgan_model()
+print("Real-ESRGAN model loaded successfully.")
 
 # =========================
 # Image Processing Functions
@@ -286,85 +257,98 @@ def enhance_low_light_image(img_tensor):
         enhanced_tensor = brightness_contrast_adjustment(img_tensor, a, b)
     return enhanced_tensor
 
-# Function to perform super-resolution using SRCNN
-def super_resolve_image(img_tensor, upscale_factor=2):
-    with torch.no_grad():
-        # Upsample the image using bicubic interpolation
-        upscaled_tensor = nn.functional.interpolate(img_tensor, scale_factor=upscale_factor, mode='bicubic', align_corners=False)
-        # Apply SRCNN
-        sr_tensor = srcnn_model(upscaled_tensor)
-        sr_tensor = torch.clamp(sr_tensor, 0, 1)
-    return sr_tensor
+# Function to perform super-resolution using Real-ESRGAN
+def super_resolve_image(img_np):
+    # img_np: NumPy array in BGR format
+    output, _ = realesrgan_model.enhance(img_np)
+    return output  # Output is a NumPy array in BGR format
 
-# Function to apply noise reduction using DnCNN
-def reduce_noise(img_tensor):
-    with torch.no_grad():
-        denoised_tensor = dncnn_model(img_tensor)
-        denoised_tensor = torch.clamp(denoised_tensor, 0, 1)
-    return denoised_tensor
+# Function to process image through all steps and create comparison
+def process_image_with_comparison(low_img_path, high_img_path, output_dir):
+    img_name = os.path.basename(low_img_path)
+    output_image_path = os.path.join(output_dir, f"processed_{img_name}")
+    comparison_image_path = os.path.join(output_dir, f"comparison_{os.path.splitext(img_name)[0]}.png")
 
-# Function to process image through all steps
-def process_image(input_image_path, output_image_path, upscale_factor=2):
-    # Load and preprocess the image
-    img = Image.open(input_image_path).convert("RGB")
+    # Load and preprocess the low-light image
+    low_img = Image.open(low_img_path).convert("RGB")
     transform = transforms.Compose([
         transforms.ToTensor()
     ])
-    img_tensor = transform(img).unsqueeze(0).to(device)
+    img_tensor = transform(low_img).unsqueeze(0).to(device)
 
     # Enhance low-light image
     enhanced_tensor = enhance_low_light_image(img_tensor)
+    enhanced_img = transforms.ToPILImage()(enhanced_tensor.squeeze(0).cpu())
 
-    # Super-resolve the enhanced image
-    sr_tensor = super_resolve_image(enhanced_tensor, upscale_factor=upscale_factor)
+    # Convert enhanced image to NumPy array (BGR format)
+    enhanced_img_np = np.array(enhanced_img)[:, :, ::-1]  # Convert RGB to BGR
 
-    # Apply noise reduction
-    final_tensor = reduce_noise(sr_tensor)
+    # Super-resolve the enhanced image using Real-ESRGAN
+    sr_img_np = super_resolve_image(enhanced_img_np)
+
+    # Convert the super-resolved image back to PIL Image (RGB)
+    sr_img = Image.fromarray(sr_img_np[:, :, ::-1])  # Convert BGR to RGB
 
     # Save the final output image
-    output_img = transforms.ToPILImage()(final_tensor.squeeze(0).cpu())
-    output_img.save(output_image_path)
+    sr_img.save(output_image_path)
     print(f"Processed image saved at {output_image_path}")
 
-    # Display the images
-    display_images(img_tensor, enhanced_tensor, sr_tensor, final_tensor)
+    # Load the ground truth high-light image
+    high_img = Image.open(high_img_path).convert("RGB")
 
-# Function to display images at different stages
-def display_images(original_tensor, enhanced_tensor, sr_tensor, final_tensor):
-    original_img = transforms.ToPILImage()(original_tensor.squeeze(0).cpu())
-    enhanced_img = transforms.ToPILImage()(enhanced_tensor.squeeze(0).cpu())
-    sr_img = transforms.ToPILImage()(sr_tensor.squeeze(0).cpu())
-    final_img = transforms.ToPILImage()(final_tensor.squeeze(0).cpu())
+    # Create comparison figure
+    create_comparison_figure(low_img, enhanced_img, sr_img, high_img, comparison_image_path)
 
-    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
-    axs[0].imshow(original_img)
-    axs[0].set_title('Original Low-Light Image')
-    axs[0].axis('off')
+# Function to create and save comparison figure
+def create_comparison_figure(low_img, enhanced_img, sr_img, high_img, save_path):
+    fig, axs = plt.subplots(2, 2, figsize=(12, 12))
 
-    axs[1].imshow(enhanced_img)
-    axs[1].set_title('Enhanced Image')
-    axs[1].axis('off')
+    axs[0, 0].imshow(low_img)
+    axs[0, 0].set_title('Original Low-Light Image')
+    axs[0, 0].axis('off')
 
-    axs[2].imshow(sr_img)
-    axs[2].set_title('Super-Resolved Image')
-    axs[2].axis('off')
+    axs[0, 1].imshow(enhanced_img)
+    axs[0, 1].set_title('Enhanced Low-Light Image')
+    axs[0, 1].axis('off')
 
-    axs[3].imshow(final_img)
-    axs[3].set_title('Final Output (Denoised)')
-    axs[3].axis('off')
+    axs[1, 0].imshow(sr_img)
+    axs[1, 0].set_title('Super-Resolved Image')
+    axs[1, 0].axis('off')
 
-    plt.show()
+    axs[1, 1].imshow(high_img)
+    axs[1, 1].set_title('Ground Truth High-Light Image')
+    axs[1, 1].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Comparison figure saved at {save_path}")
+
+# Function to process a batch of images with comparisons
+def process_image_batch_with_comparisons(image_names, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    for img_name in image_names:
+        low_img_path = os.path.join(low_light_image_dir, img_name)
+        high_img_path = os.path.join(high_light_image_dir, img_name)
+
+        if not os.path.exists(low_img_path) or not os.path.exists(high_img_path):
+            print(f"Skipping {img_name} as corresponding images not found.")
+            continue
+
+        print(f"Processing {img_name}...")
+        process_image_with_comparison(low_img_path, high_img_path, output_dir)
 
 # =========================
 # Example Usage
 # =========================
 
 if __name__ == "__main__":
-    # Example input image path (you can change this to your own image)
-    input_image_path = 'low_light_image.jpg'  # Path to the input low-light image
-    output_image_path = 'final_output_image.jpg'  # Path to save the final processed image
+    # Select 10 random images from the low-light image directory
+    all_images = [fname for fname in os.listdir(low_light_image_dir) if fname.lower().endswith(IMAGE_EXTENSIONS)]
+    selected_images = random.sample(all_images, 10)
 
-    if not os.path.exists(input_image_path):
-        print(f"Input image '{input_image_path}' not found. Please provide a valid image path.")
-    else:
-        process_image(input_image_path, output_image_path, upscale_factor=2)
+    # Output directory
+    output_dir = 'processed_images_with_comparisons'
+
+    # Process the batch of images with comparisons
+    process_image_batch_with_comparisons(selected_images, output_dir)
