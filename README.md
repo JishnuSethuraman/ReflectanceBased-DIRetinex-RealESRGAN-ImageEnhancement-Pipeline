@@ -13,7 +13,7 @@ The Retinex theory models an image as a product of reflectance and illumination 
 This project uses the recently published [DI-Retinex model](https://arxiv.org/abs/2404.03327), a lightweight Convolutional Neural Network (CNN) that enhances visibility by predicting brightness and contrast adjustment coefficients, achieving natural-looking results.
 
 ### Real-ESRGAN
-Real-ESRGAN is a GAN-based approach for image super-resolution, enhancing image details and textures. By integrating Real-ESRGAN into the pipeline, the enhanced low-light images are upscaled, producing high-resolution outputs with improved visual quality.
+[Real-ESRGAN](https://github.com/xinntao/ESRGAN) is a GAN-based approach for image super-resolution, enhancing image details and textures. By integrating Real-ESRGAN into the pipeline, the enhanced low-light images are upscaled, producing high-resolution outputs with improved visual quality.
 
 ## Project Overview
 
@@ -57,7 +57,7 @@ The pipeline consists of two main components:
    pip install numpy matplotlib pillow tqdm
    pip install basicsr realesrgan
 
-   4. **Download Real-ESRGAN Model Weights**
+4. **Download Real-ESRGAN Model Weights**
    - Download `RealESRGAN_x4plus.pth` from the [Real-ESRGAN release page](https://github.com/xinntao/Real-ESRGAN).
    - Create a `weights` directory in the project root and place the model file inside:
      ```bash
