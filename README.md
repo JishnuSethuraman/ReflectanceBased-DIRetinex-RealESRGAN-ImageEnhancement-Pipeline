@@ -164,7 +164,7 @@ The output comparison figures allow you to visually assess the performance of th
 3. **Super-Resolved Image**: The enhanced image upscaled with added details.
 4. **Ground Truth High-Light Image**: The reference image with proper lighting.
 
-# Example:
+### Example:
 ![Image 1](https://github.com/user-attachments/assets/c666b940-19b1-4395-b740-c71681512782)
 
 
