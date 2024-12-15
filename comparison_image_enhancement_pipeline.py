@@ -1,6 +1,7 @@
 # File: comparison_image_enhancement_pipeline.py
 
 import os
+import cv2
 import random
 import numpy as np
 import matplotlib.pyplot as plt
@@ -263,6 +264,40 @@ def super_resolve_image(img_np):
     output, _ = realesrgan_model.enhance(img_np)
     return output  # Output is a NumPy array in BGR format
 
+from skimage.metrics import peak_signal_noise_ratio as psnr
+from skimage.metrics import structural_similarity as ssim
+
+# Function to calculate PSNR and SSIM
+def calculate_psnr_ssim(original, generated):
+    """
+    Calculate PSNR and SSIM between two images.
+
+    Args:
+        original (PIL.Image or np.ndarray): Ground truth image.
+        generated (PIL.Image or np.ndarray): Enhanced/super-resolved image.
+
+    Returns:
+        tuple: PSNR and SSIM values.
+    """
+    if isinstance(original, Image.Image):
+        original = np.array(original)
+    if isinstance(generated, Image.Image):
+        generated = np.array(generated)
+
+    # Ensure dimensions match
+    if original.shape != generated.shape:
+        generated = cv2.resize(generated, (original.shape[1], original.shape[0]))
+
+    # Calculate PSNR
+    psnr_value = psnr(original, generated, data_range=original.max() - original.min())
+
+    # Calculate SSIM with smaller win_size if necessary
+    min_dimension = min(original.shape[:2])  # Find the smaller dimension
+    win_size = min(7, min_dimension)  # Ensure win_size does not exceed image dimensions
+    ssim_value = ssim(original, generated, win_size=win_size, channel_axis=-1)
+
+    return psnr_value, ssim_value
+
 # Function to process image through all steps and create comparison
 def process_image_with_comparison(low_img_path, high_img_path, output_dir):
     img_name = os.path.basename(low_img_path)
@@ -271,33 +306,67 @@ def process_image_with_comparison(low_img_path, high_img_path, output_dir):
 
     # Load and preprocess the low-light image
     low_img = Image.open(low_img_path).convert("RGB")
-    transform = transforms.Compose([
-        transforms.ToTensor()
-    ])
-    img_tensor = transform(low_img).unsqueeze(0).to(device)
+    transform_basic = transforms.Compose([transforms.ToTensor()])
+    img_tensor = transform_basic(low_img).unsqueeze(0).to(device)
 
-    # Enhance low-light image
-    enhanced_tensor = enhance_low_light_image(img_tensor)
+    # Enhance low-light image using the reflectance model only
+    with torch.no_grad():
+        coefficients = reflectance_model(img_tensor)
+        a, b = map_coefficients(coefficients)
+        enhanced_tensor = brightness_contrast_adjustment(img_tensor, a, b)
     enhanced_img = transforms.ToPILImage()(enhanced_tensor.squeeze(0).cpu())
-
-    # Convert enhanced image to NumPy array (BGR format)
-    enhanced_img_np = np.array(enhanced_img)[:, :, ::-1]  # Convert RGB to BGR
-
-    # Super-resolve the enhanced image using Real-ESRGAN
-    sr_img_np = super_resolve_image(enhanced_img_np)
-
-    # Convert the super-resolved image back to PIL Image (RGB)
-    sr_img = Image.fromarray(sr_img_np[:, :, ::-1])  # Convert BGR to RGB
-
-    # Save the final output image
-    sr_img.save(output_image_path)
-    print(f"Processed image saved at {output_image_path}")
 
     # Load the ground truth high-light image
     high_img = Image.open(high_img_path).convert("RGB")
 
-    # Create comparison figure
-    create_comparison_figure(low_img, enhanced_img, sr_img, high_img, comparison_image_path)
+    # Calculate PSNR/SSIM for reflectance-only result
+    psnr_reflectance, ssim_reflectance = calculate_psnr_ssim(high_img, enhanced_img)
+
+    # Now pass the enhanced image through Real-ESRGAN
+    enhanced_img_np = np.array(enhanced_img)[:, :, ::-1]  # Convert RGB to BGR for Real-ESRGAN
+    sr_img_np = super_resolve_image(enhanced_img_np)
+    sr_img = Image.fromarray(sr_img_np[:, :, ::-1])  # Convert BGR back to RGB
+
+    # Calculate PSNR/SSIM for the combined pipeline result
+    psnr_combined, ssim_combined = calculate_psnr_ssim(high_img, sr_img)
+
+    # Save the final output image (combined pipeline result)
+    sr_img.save(output_image_path)
+    print(f"Processed image saved at {output_image_path}")
+
+    # Print both metrics to compare
+    print(f"For {img_name}:")
+    print(f"  Reflectance-Only: PSNR = {psnr_reflectance:.2f}, SSIM = {ssim_reflectance:.3f}")
+    print(f"  Combined Pipeline: PSNR = {psnr_combined:.2f}, SSIM = {ssim_combined:.3f}")
+
+    # Create a comparison figure including both stages
+    create_extended_comparison_figure(low_img, enhanced_img, sr_img, high_img, comparison_image_path)
+
+    return (img_name, psnr_reflectance, ssim_reflectance, psnr_combined, ssim_combined)
+
+def create_extended_comparison_figure(low_img, enhanced_img, sr_img, high_img, save_path):
+    fig, axs = plt.subplots(2, 2, figsize=(12, 12))
+
+    axs[0, 0].imshow(low_img)
+    axs[0, 0].set_title('Original Low-Light Image')
+    axs[0, 0].axis('off')
+
+    axs[0, 1].imshow(enhanced_img)
+    axs[0, 1].set_title('Reflectance-Only Enhanced')
+    axs[0, 1].axis('off')
+
+    axs[1, 0].imshow(sr_img)
+    axs[1, 0].set_title('Reflectance + ESRGAN')
+    axs[1, 0].axis('off')
+
+    axs[1, 1].imshow(high_img)
+    axs[1, 1].set_title('Ground Truth High-Light Image')
+    axs[1, 1].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Comparison figure saved at {save_path}")
 
 # Function to create and save comparison figure
 def create_comparison_figure(low_img, enhanced_img, sr_img, high_img, save_path):
@@ -327,6 +396,8 @@ def create_comparison_figure(low_img, enhanced_img, sr_img, high_img, save_path)
 # Function to process a batch of images with comparisons
 def process_image_batch_with_comparisons(image_names, output_dir):
     os.makedirs(output_dir, exist_ok=True)
+    results = []
+
     for img_name in image_names:
         low_img_path = os.path.join(low_light_image_dir, img_name)
         high_img_path = os.path.join(high_light_image_dir, img_name)
@@ -336,11 +407,23 @@ def process_image_batch_with_comparisons(image_names, output_dir):
             continue
 
         print(f"Processing {img_name}...")
-        process_image_with_comparison(low_img_path, high_img_path, output_dir)
+        img_name, psnr_refl, ssim_refl, psnr_comb, ssim_comb = process_image_with_comparison(low_img_path, high_img_path, output_dir)
+        results.append((img_name, psnr_refl, ssim_refl, psnr_comb, ssim_comb))
 
-# =========================
-# Example Usage
-# =========================
+    # Print metrics for all images
+    print("\nMetrics Summary:")
+    print(f"{'Image':<30} {'PSNR_ReflOnly':<15} {'SSIM_ReflOnly':<15} {'PSNR_Combined':<15} {'SSIM_Combined':<15}")
+    for img_name, psnr_refl, ssim_refl, psnr_comb, ssim_comb in results:
+        print(f"{img_name:<30} {psnr_refl:<15.2f} {ssim_refl:<15.3f} {psnr_comb:<15.2f} {ssim_comb:<15.3f}")
+
+    # Optionally, save metrics to a file
+    metrics_path = os.path.join(output_dir, "metrics_comparison.txt")
+    with open(metrics_path, "w") as f:
+        f.write(f"{'Image':<30} {'PSNR_ReflOnly':<15} {'SSIM_ReflOnly':<15} {'PSNR_Combined':<15} {'SSIM_Combined':<15}\n")
+        for img_name, psnr_refl, ssim_refl, psnr_comb, ssim_comb in results:
+            f.write(f"{img_name:<30} {psnr_refl:<15.2f} {ssim_refl:<15.3f} {psnr_comb:<15.2f} {ssim_comb:<15.3f}\n")
+    print(f"Metrics saved to {metrics_path}")
+
 
 if __name__ == "__main__":
     # Select 10 random images from the low-light image directory
